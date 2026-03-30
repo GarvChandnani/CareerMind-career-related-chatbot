@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from "react";
+import { OpenRouter } from "@openrouter/sdk";
 
 const INTENT_CONFIG = {
     RESUME: { label: "Resume Help", color: "#f59e0b", icon: "📄" },
@@ -17,6 +18,15 @@ const SUGGESTIONS = [
     "How do I cold email a hiring manager effectively?",
     "What skills do I need to break into data science?",
 ];
+
+const openrouter = new OpenRouter({
+    apiKey: import.meta.env.VITE_OPENROUTER_API_KEY
+});
+
+const SYSTEM_PROMPT = `You are CareerMind, a highly intelligent career advisory agent.
+Your ONLY output format is to FIRST provide your detected intent on a single line starting with: "INTENT: [INTENT_NAME]", followed immediately by your detailed advisory response on the next line.
+Allowed INTENT_NAMEs: RESUME, JOB_SEARCH, INTERVIEW, CORPORATE, TECHNICAL, GENERAL.
+Provide brilliant, actionable, hyper-specific career guidance. Never break character.`;
 
 // ── Agent pipeline indicator ──────────────────────────────────────────────────
 const AgentStep = ({ phase, status, detail }) => {
@@ -210,92 +220,110 @@ export default function CareerAgent() {
         setMessages(prev => [...prev, assistantEntry]);
 
         try {
-            abortRef.current = new AbortController();
-
-            const res = await fetch("http://127.0.0.1:5000/api/chat", {
-                method: "POST",
-                signal: abortRef.current.signal,
-                headers: {
-                    "Content-Type": "application/json"
-                },
-                body: JSON.stringify({
-                    messages: historyRef.current.map(m => ({ role: m.role, content: m.content }))
-                }),
+            // Validate and log messages
+            const validatedMessages = historyRef.current.map(m => {
+                if (!m.role || !m.content) {
+                    console.error("Invalid message format:", m);
+                    throw new Error("Invalid message format. Each message must have 'role' and 'content'.");
+                }
+                return { role: m.role, content: m.content };
             });
 
-            if (!res.ok) throw new Error(`API ${res.status}`);
+            console.log("Sending messages:", validatedMessages);
 
-            const reader = res.body.getReader();
+            // Use standard fetch to avoid SDK validation issues
+            const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+                method: "POST",
+                headers: {
+                    "Authorization": `Bearer ${import.meta.env.VITE_OPENROUTER_API_KEY}`,
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": "http://localhost:5173", // Site URL for OpenRouter ranking
+                    "X-OpenRouter-Title": "CareerMind Agent"
+                },
+                body: JSON.stringify({
+                    model: "google/gemma-3-4b-it:free",
+                    messages: [
+                        { 
+                          role: "user", 
+                          content: `${SYSTEM_PROMPT}\n\nUser: ${validatedMessages[0].content}` 
+                        },
+                        ...validatedMessages.slice(1).map(m => ({
+                            role: m.role,
+                            content: m.content
+                        }))
+                    ],
+                    stream: true
+                })
+            });
+
+            if (!response.ok) throw new Error(`API error: ${response.status}`);
+
+            const reader = response.body.getReader();
             const decoder = new TextDecoder();
-            let buffer = "";
-            let full = "";
-            let intentParsed = false;
-            let detectedIntent = "GENERAL";
+            let fullResponse = "";
 
             while (true) {
                 const { done, value } = await reader.read();
                 if (done) break;
 
-                buffer += decoder.decode(value, { stream: true });
-                const lines = buffer.split("\n");
-                buffer = lines.pop();              // keep incomplete line
+                const chunk = decoder.decode(value);
+                const lines = chunk.split("\n").filter(line => line.trim().startsWith("data: "));
 
                 for (const line of lines) {
-                    if (!line.startsWith("data:")) continue;
-                    const raw = line.slice(5).trim();
-                    if (raw === "[DONE]") continue;
+                    const dataStr = line.replace("data: ", "").trim();
+                    if (dataStr === "[DONE]") {
+                        setAgentPhase({ perceive: "done", decide: "done", act: "done" });
+                        continue;
+                    }
 
-                    let evt;
-                    try { evt = JSON.parse(raw); } catch { continue; }
+                    try {
+                        const json = JSON.parse(dataStr);
+                        const content = json.choices[0]?.delta?.content;
+                        if (content) {
+                            fullResponse += content;
+                            setMessages(prev => {
+                                const next = [...prev];
+                                const lastMsg = next[next.length - 1];
+                                
+                                let cleanContent = fullResponse;
+                                let intent = lastMsg.intent;
+                                if (fullResponse.startsWith("INTENT: ")) {
+                                    const lines = fullResponse.split("\n");
+                                    const intentMatch = lines[0].match(/INTENT: (RESUME|JOB_SEARCH|INTERVIEW|CORPORATE|TECHNICAL|GENERAL)/);
+                                    if (intentMatch) {
+                                        intent = intentMatch[1];
+                                        setDetectedIntent(intent);
+                                        cleanContent = lines.slice(1).join("\n").trim();
+                                    }
+                                }
 
-                    if (evt.choices && evt.choices[0]?.delta?.content) {
-                        full += evt.choices[0].delta.content;
-
-                        // Parse INTENT line as soon as it appears
-                        if (!intentParsed && full.includes("\n")) {
-                            const m = full.match(/^INTENT:\s*(\w+)\n/);
-                            if (m) {
-                                detectedIntent = INTENT_CONFIG[m[1]] ? m[1] : "GENERAL";
-                                intentParsed = true;
-                                setDetectedIntent(detectedIntent);
-                            }
+                                next[next.length - 1] = { role: "assistant", content: cleanContent, intent: intent };
+                                return next;
+                            });
                         }
 
-                        // Strip INTENT line from displayed text
-                        const display = full.replace(/^INTENT:\s*\w+\n?/, "");
-                        setMessages(prev => {
-                            const next = [...prev];
-                            next[next.length - 1] = { role: "assistant", content: display, intent: intentParsed ? detectedIntent : null };
-                            return next;
-                        });
+                        if (json.usage) {
+                            console.log("\nReasoning tokens:", json.usage.reasoningTokens);
+                        }
+                    } catch (err) {
+                        console.warn("Error parsing chunk:", err);
                     }
                 }
             }
 
-            // Finalise
-            const cleanFull = full.replace(/^INTENT:\s*\w+\n?/, "").trim();
-            const finalEntry = { role: "assistant", content: cleanFull, intent: detectedIntent };
-            historyRef.current = [...historyRef.current, { role: "assistant", content: full }];
-            setMessages(prev => {
-                const next = [...prev];
-                next[next.length - 1] = finalEntry;
-                return next;
-            });
             setAgentPhase({ perceive: "done", decide: "done", act: "done" });
 
         } catch (err) {
-            if (err.name !== "AbortError") {
-                console.error("Agent error:", err);
-                setMessages(prev => {
-                    const next = [...prev];
-                    next[next.length - 1] = {
-                        role: "assistant",
-                        content: `⚠️ Something went wrong: ${err.message}. Check your API key.`,
-                        intent: "GENERAL",
-                    };
-                    return next;
-                });
-            }
+            console.error("Agent error:", err);
+            setMessages(prev => {
+                const next = [...prev];
+                next[next.length - 1] = {
+                    role: "assistant",
+                    content: `⚠️ Something went wrong: ${err.message}.`,
+                    intent: "GENERAL",
+                };
+                return next;
+            });
         } finally {
             setIsStreaming(false);
             setTimeout(() => setAgentPhase({ perceive: "idle", decide: "idle", act: "idle" }), 2500);

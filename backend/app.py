@@ -25,10 +25,10 @@ API_KEY = os.getenv("VITE_ANTHROPIC_API_KEY") or os.getenv("OPENROUTER_API_KEY")
 
 # Ordered list of free models to try — if one is rate-limited, fallback to the next
 FREE_MODELS = [
+    "qwen/qwen-2.5-7b-instruct:free",
     "google/gemma-3-12b-it:free",
     "google/gemma-3-4b-it:free",
     "meta-llama/llama-3.2-3b-instruct:free",
-    "qwen/qwen-2.5-7b-instruct:free",
     "microsoft/phi-3-mini-128k-instruct:free",
 ]
 
@@ -46,6 +46,14 @@ def chat():
         { "role": "assistant", "content": "INTENT: GENERAL\nUnderstood. I am CareerMind, ready to assist." }
     ]
     messages.extend(user_messages)
+
+    # Validate and log messages before sending to OpenRouter
+    if not isinstance(user_messages, list) or not all(isinstance(m, dict) and 'role' in m and 'content' in m for m in user_messages):
+        return jsonify({"error": "Invalid 'messages' format. Must be an array of objects with 'role' and 'content'."}), 400
+
+    print("Validated messages:", json.dumps(user_messages, indent=2))
+
+    print("Sending payload to OpenRouter:", json.dumps(messages, indent=2))
 
     headers = {
         "Content-Type": "application/json",
