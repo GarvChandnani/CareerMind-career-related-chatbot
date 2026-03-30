@@ -29,3 +29,8 @@ __pycache__/
 *$py.class
 venv/
 .venv/
+
+# Local tests and output
+test_*.py
+test_*.js
+out.*
