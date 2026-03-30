@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import requests
 from flask import Flask, request, Response, jsonify
 from flask_cors import CORS
@@ -21,6 +22,15 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 # Try to get the API key using either of these variable names
 API_KEY = os.getenv("VITE_ANTHROPIC_API_KEY") or os.getenv("OPENROUTER_API_KEY")
+
+# Ordered list of free models to try — if one is rate-limited, fallback to the next
+FREE_MODELS = [
+    "google/gemma-3-12b-it:free",
+    "google/gemma-3-4b-it:free",
+    "meta-llama/llama-3.2-3b-instruct:free",
+    "qwen/qwen-2.5-7b-instruct:free",
+    "microsoft/phi-3-mini-128k-instruct:free",
+]
 
 @app.route('/api/chat', methods=['POST'])
 def chat():
@@ -44,29 +54,88 @@ def chat():
         "X-OpenRouter-Title": "CareerMind Agent"
     }
 
-    payload = {
-        "model": "google/gemma-3-4b-it:free",
-        "max_tokens": 1024,
-        "stream": True,
-        "messages": messages
-    }
-
-    # Proxy the streaming response back to the client
+    # Proxy the streaming response back to the client — tries each free model in order
     def generate():
-        try:
-            with requests.post(OPENROUTER_URL, headers=headers, json=payload, stream=True) as resp:
-                resp.raise_for_status()
-                for line in resp.iter_lines():
-                    if line:
-                        yield line.decode('utf-8') + '\n\n'
-        except requests.exceptions.RequestException as e:
-            # Send an error event to the stream if it fails
-            error_msg = json.dumps({"choices": [{"delta": {"content": f"\\n\\nServer Error: {str(e)}"}}]})
-            yield f"data: {error_msg}\n\n"
-            yield "data: [DONE]\n\n"
+        last_error = "Unknown error"
+        for model in FREE_MODELS:
+            payload = {
+                "model": model,
+                "max_tokens": 1024,
+                "stream": True,
+                "messages": messages
+            }
+            try:
+                with requests.post(OPENROUTER_URL, headers=headers, json=payload, stream=True, timeout=30) as resp:
+                    if resp.status_code == 429:
+                        # Rate limited — wait briefly then try the next model
+                        print(f"[429] Model {model} rate-limited, trying next...")
+                        last_error = f"Model {model} rate-limited (429)"
+                        time.sleep(1)
+                        continue
+                    resp.raise_for_status()
+                    print(f"[OK] Using model: {model}")
+                    has_yielded = False
+                    for line in resp.iter_lines():
+                        if line:
+                            decoded_line = line.decode('utf-8')
+                            yield decoded_line + '\n\n'
+                            has_yielded = True
+                    
+                    if has_yielded:
+                        print(f"[DONE] Stream finished for {model}")
+                        return
+                    else:
+                        print(f"[WARN] Empty stream for {model}, trying next...")
+                        continue
+            except requests.exceptions.RequestException as e:
+                last_error = str(e)
+                print(f"[ERR] {model}: {e}")
+                time.sleep(1)
+                continue
+
+        # All models failed — send a friendly error downstream
+        error_msg = json.dumps({"choices": [{"delta": {"content": f"⚠️ All free models are currently rate-limited. Please wait a minute and try again.\n\n({last_error})"}}]})
+        yield f"data: {error_msg}\n\n"
+        yield "data: [DONE]\n\n"
 
     # Important: return as text/event-stream so the frontend parses it correctly
     return Response(generate(), mimetype='text/event-stream')
+
+@app.route('/api/test-vision', methods=['GET', 'POST'])
+def test_vision():
+    if not API_KEY:
+        return jsonify({"error": "Missing API Key on server. Check .env file."}), 500
+
+    response = requests.post(
+      url="https://openrouter.ai/api/v1/chat/completions",
+      headers={
+        "Authorization": f"Bearer {API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "http://localhost:5000",
+        "X-OpenRouter-Title": "CareerMind Agent"
+      },
+      data=json.dumps({
+        "model": "google/gemma-3-4b-it:free",
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "What is in this image?"
+              },
+              {
+                "type": "image_url",
+                "image_url": {
+                  "url": "https://live.staticflickr.com/3851/14825276609_098cac593d_b.jpg"
+                }
+              }
+            ]
+          }
+        ]
+      })
+    )
+    return jsonify(response.json())
 
 if __name__ == '__main__':
     app.run(port=5000, debug=True)

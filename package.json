@@ -10,6 +10,8 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@openrouter/sdk": "^0.10.2",
+    "dotenv": "^17.3.1",
     "react": "^19.2.4",
     "react-dom": "^19.2.4"
   },
